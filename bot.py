@@ -15,7 +15,6 @@ from datetime import datetime
 
 load_dotenv()
 
-# ── Locate ffmpeg (no admin / PATH required) ──
 _FFMPEG_CANDIDATES = [
     r"C:\Users\VICTUS\ffmpeg\ffmpeg-master-latest-win64-gpl\bin\ffmpeg.exe",
     "ffmpeg",   # fallback: system PATH
@@ -34,15 +33,10 @@ for _ff_path in _FFMPEG_CANDIDATES:
 else:
     print("[ffmpeg] WARNING: ffmpeg not found — MP3 export and Whisper will fail.")
 
-# pycord voice receive uses select.select() which requires SelectorEventLoop on Windows.
-# asyncio.run() (used inside bot.run()) always creates a new loop from the policy,
-# so on Python 3.14 we must create a SelectorEventLoop manually and run bot.start()
-# on it directly — bypassing asyncio.run() entirely.
 if sys.platform == "win32":
     _selector_loop = asyncio.SelectorEventLoop()
     asyncio.set_event_loop(_selector_loop)
 
-# ── Load Opus codec (required for voice to stay connected on Windows)
 if not discord.opus.is_loaded():
     try:
         discord.opus._load_default()
@@ -50,49 +44,30 @@ if not discord.opus.is_loaded():
     except Exception as e:
         print(f"[Opus] Warning: Could not load opus: {e}")
 
-# ─────────────────────────────────────────
-#  Config
-# ─────────────────────────────────────────
 DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
-WHISPER_MODEL   = os.getenv("WHISPER_MODEL", "base")    # tiny | base | small | medium | large  OR path to .pt
-LANGUAGE        = os.getenv("LANGUAGE", "th")           # transcription language: th | en | ja | zh ...
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2") # any model you have pulled in Ollama
+WHISPER_MODEL   = os.getenv("WHISPER_MODEL", "base")
+LANGUAGE        = os.getenv("LANGUAGE", "th")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
 _guild_id       = os.getenv("GUILD_ID")
 GUILD_IDS       = [int(_guild_id)] if _guild_id and _guild_id != "your_guild_id_here" else None
 # GUILD_IDS = None  → global commands (up to 1 hour to appear)
 # GUILD_IDS = [123] → guild-only commands (appear instantly, good for development)
 
-# ── Load openai-whisper model ──
 print(f"[Whisper] Loading model: {WHISPER_MODEL} ...")
 _t0 = time.perf_counter()
 whisper_model = whisper.load_model(WHISPER_MODEL)
 print(f"[Whisper] Model ready. ({time.perf_counter()-_t0:.1f}s)")
 
-# ─────────────────────────────────────────
-#  Bot setup
-# ─────────────────────────────────────────
 intents = discord.Intents.default()
 
 bot = discord.Bot(intents=intents)
 
-# ─────────────────────────────────────────
-#  Monkey-patch: fix ssrc_map deadlock (Python 3.14 / pycord 2.6)
-#
-#  pycord's recv_decoded_audio spins forever:
-#      while data.ssrc not in self.ws.ssrc_map: time.sleep(0.05)
-#  Discord doesn't always send the speaking opcode before audio
-#  packets arrive, so ssrc is never in ssrc_map and the decode
-#  thread hangs — leaving audio_data empty when stop() is called.
-#
-#  Fix: wait at most 2 s, then fall back to ssrc as the user key.
-# ─────────────────────────────────────────
 import discord.voice_client as _vc_module
 import discord.opus as _opus_module
 
 def _patched_recv_decoded_audio(self, data):
-    from discord.sinks.core import RawData  # type: ignore
+    from discord.sinks.core import RawData 
 
-    # Silence / timestamp bookkeeping (identical to pycord original)
     if data.ssrc not in self.user_timestamps:
         if not self.user_timestamps or not self.sync_start:
             self.first_packet_timestamp = data.receive_time
@@ -112,18 +87,15 @@ def _patched_recv_decoded_audio(self, data):
         + data.decoded_data
     )
 
-    # ── PATCHED: wait at most 2 s for ssrc → user_id mapping ──
     deadline = time.perf_counter() + 2.0
     while data.ssrc not in self.ws.ssrc_map:
         if time.perf_counter() > deadline:
             print(f"[Patch] ssrc {data.ssrc} not in ssrc_map after 2 s — using ssrc as user key")
             print(f"[Patch] ssrc_map contents: {dict(self.ws.ssrc_map)}")
-            # Store audio under ssrc directly so data isn't lost
             self.sink.write(data.decoded_data, data.ssrc)
             return
         time.sleep(0.05)
 
-    # ssrc_map value is a dict: {"user_id": "123456", "speaking": ...}
     entry = self.ws.ssrc_map[data.ssrc]
     user_id = entry["user_id"] if isinstance(entry, dict) else entry
     self.sink.write(data.decoded_data, int(user_id))
@@ -131,11 +103,6 @@ def _patched_recv_decoded_audio(self, data):
 _vc_module.VoiceClient.recv_decoded_audio = _patched_recv_decoded_audio
 
 
-# ─────────────────────────────────────────
-#  Monkey-patch recv_audio to catch silent crashes
-#  The original has no try/except around unpack_audio — any exception kills the
-#  thread silently, leaving audio_data empty.
-# ─────────────────────────────────────────
 import select as _select
 
 def _patched_recv_audio(self, sink, callback, *args):
@@ -182,11 +149,6 @@ def _patched_recv_audio(self, sink, callback, *args):
 
 _vc_module.VoiceClient.recv_audio = _patched_recv_audio
 
-# ─────────────────────────────────────────
-#  Monkey-patch empty_socket to handle Python 3.14's socket incompatibility.
-#  Original: select.select([self.socket], [], [], 0.0)
-#  Fails on Python 3.14 with: TypeError: argument must be an int, or have a fileno() method.
-# ─────────────────────────────────────────
 def _patched_empty_socket(self):
     try:
         if self.socket is None:
@@ -196,19 +158,13 @@ def _patched_empty_socket(self):
             self.socket.recv(4096)
             ready, _, _ = _select.select([self.socket], [], [], 0.0)
     except (TypeError, OSError):
-        pass  # socket not ready or not a real socket — safe to ignore
+        pass
 
 _vc_module.VoiceClient.empty_socket = _patched_empty_socket
 
-# Track active recording sessions per guild
 recording_sessions: dict[int, dict] = {}
-# Store VoiceClient objects directly — ctx.voice_client is unreliable on Python 3.14
 voice_clients: dict[int, discord.VoiceClient] = {}
 
-
-# ─────────────────────────────────────────
-#  Helper: mix WAV bytes → MP3 bytes via direct ffmpeg subprocess
-# ─────────────────────────────────────────
 def _sync_mix_to_mp3(wav_bytes_list: list[bytes]) -> bytes:
     """
     Mix one or more WAV byte strings and return an MP3 byte string.
@@ -243,9 +199,6 @@ def _sync_mix_to_mp3(wav_bytes_list: list[bytes]) -> bytes:
                 pass
 
 
-# ─────────────────────────────────────────
-#  Helper: run sync Whisper in a thread pool
-# ─────────────────────────────────────────
 async def transcribe_audio(audio_bytes: bytes, user_label: str = "") -> str:
     """
     Runs Whisper inference in a thread pool so the async event loop is not blocked.
@@ -268,20 +221,16 @@ async def transcribe_audio(audio_bytes: bytes, user_label: str = "") -> str:
     return await loop.run_in_executor(None, _sync_transcribe)
 
 
-# ─────────────────────────────────────────
-#  Recording finished callback
-# ─────────────────────────────────────────
 async def finished_callback(
     sink: discord.sinks.WaveSink,
     channel: discord.TextChannel,
     *args,
 ):
     """Triggered automatically when stop_recording() is called."""
-    # ── DEBUG: dump sink state to console ──
     print(f"[Callback] sink type       : {type(sink)}")
     print(f"[Callback] audio_data keys : {list(sink.audio_data.keys())}")
     for uid, aud in sink.audio_data.items():
-        aud.file.seek(0, 2)  # seek to end
+        aud.file.seek(0, 2)
         size = aud.file.tell()
         aud.file.seek(0)
         print(f"[Callback]   user {uid}: {size} bytes")
@@ -293,7 +242,6 @@ async def finished_callback(
         f"⏳ Converting audio & transcribing with Whisper ({WHISPER_MODEL})..."
     )
 
-    # ── Collect raw WAV bytes per user (read once, reuse for both MP3 and Whisper) ──
     user_audio_bytes: dict[int, bytes] = {}
     for user_id, audio in sink.audio_data.items():
         audio.file.seek(0)
@@ -303,7 +251,6 @@ async def finished_callback(
         user_audio_bytes[user_id] = raw_bytes
         print(f"[Record] User {user_id}: captured {len(raw_bytes)} bytes")
 
-    # ── Mix all users' WAV streams and export as MP3 via direct ffmpeg subprocess ──
     if user_audio_bytes:
         try:
             loop = asyncio.get_running_loop()
@@ -325,7 +272,6 @@ async def finished_callback(
 
     await channel.send(f"Transcribing with Whisper `{WHISPER_MODEL}` (this may take a minute on CPU)...")
 
-    # ── Transcribe each user with Whisper ──
     all_transcripts: list[str] = []
     for user_id, raw_bytes in user_audio_bytes.items():
         try:
@@ -348,7 +294,6 @@ async def finished_callback(
 
     full_transcript = "\n".join(all_transcripts)
 
-    # ─── Summarize with Ollama (100% free, runs locally) ───
     await channel.send(f"Summarizing with Ollama ({OLLAMA_MODEL})...")
     try:
         def _sync_summarize() -> str:
@@ -382,26 +327,19 @@ async def finished_callback(
         )
         return
 
-    # ─── Post Markdown to Discord ───
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     header = f"## 📋 สรุปการประชุม — {timestamp}\n\n"
 
-    # Discord has a 2000-char message limit — split if needed
     full_message = header + summary_md
     for chunk in [full_message[i : i + 1990] for i in range(0, len(full_message), 1990)]:
         await channel.send(chunk)
 
-    # Send the raw transcript as Discord spoilers (click to reveal)
     transcript_msg = "### 📝 บทสนทนาทั้งหมด\n" + "\n".join(
         f"||{line}||" for line in all_transcripts
     )
     if len(transcript_msg) <= 1990:
         await channel.send(transcript_msg)
 
-
-# ─────────────────────────────────────────
-#  Slash Commands
-# ─────────────────────────────────────────
 @bot.slash_command(name="help", description="Show all available commands", guild_ids=GUILD_IDS)
 async def help_command(ctx: discord.ApplicationContext):
     embed = discord.Embed(
@@ -461,7 +399,6 @@ async def join(ctx: discord.ApplicationContext):
 
     channel = ctx.author.voice.channel
 
-    # Defer early — if interaction already expired (10062), we still join anyway
     deferred = False
     try:
         await ctx.defer()
@@ -472,18 +409,15 @@ async def join(ctx: discord.ApplicationContext):
         print(f"[Join] Defer failed: {exc}")
 
     try:
-        # Always check guild's actual voice client first — it's always up to date
         existing_vc = ctx.guild.voice_client
         if existing_vc:
             await existing_vc.move_to(channel)
             vc = existing_vc
         else:
-            # Retry up to 3 times — pycord sometimes gets empty modes list on first try
             vc = None
             last_exc = None
             for attempt in range(3):
                 try:
-                    # Disconnect any stale vc before retrying
                     stale = ctx.guild.voice_client
                     if stale:
                         await stale.disconnect(force=True)
@@ -497,10 +431,8 @@ async def join(ctx: discord.ApplicationContext):
             if vc is None:
                 raise last_exc
 
-        # Wait for voice connection to fully stabilize
         await asyncio.sleep(1)
-        # Python 3.14 bug: is_connected() returns False even when connected
-        # Force-set the internal flag so start_recording() works correctly
+
         if hasattr(vc, '_connected'):
             vc._connected.set()
         voice_clients[ctx.guild_id] = vc
@@ -546,7 +478,6 @@ async def record(
             await ctx.channel.send("⚠️ Already recording. Use `/stop` to stop.")
         return
 
-    # Defer — fall back to channel.send if interaction expired
     deferred = False
     try:
         await ctx.defer()
@@ -563,14 +494,13 @@ async def record(
     target_channel = output_channel or ctx.channel
     recording_sessions[ctx.guild_id] = {"channel": target_channel}
 
-    # Force _connected + log real state right before start_recording
     sock  = getattr(vc, 'socket', None)
     ws_obj = getattr(vc, 'ws', None)
     print(f"[Record] PRE-start: socket={sock!r}")
     print(f"[Record] PRE-start: ws={ws_obj!r}")
     print(f"[Record] PRE-start: _connected.is_set={vc._connected.is_set()}")
     if sock is not None:
-        vc._connected.set()   # restore if cleared by pycord internals
+        vc._connected.set()
     print(f"[Record] PRE-start: is_connected={vc.is_connected()}  recording={getattr(vc,'recording',False)}")
 
     try:
@@ -658,10 +588,6 @@ async def leave(ctx: discord.ApplicationContext):
     else:
         await ctx.channel.send(msg)
 
-
-# ─────────────────────────────────────────
-#  Events
-# ─────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"✅ Bot is ready: {bot.user} (ID: {bot.user.id})")
@@ -685,9 +611,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         print(f"[Voice] Bot moved: '{before.channel.name}' → '{after.channel.name}'", flush=True)
 
 
-# ─────────────────────────────────────────
-#  Run
-# ─────────────────────────────────────────
 if __name__ == "__main__":
     import signal
 

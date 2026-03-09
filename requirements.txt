@@ -1,0 +1,17 @@
+# Discord bot — voice recording + Whisper transcription + Ollama summarization
+
+# Core Discord library with voice receive support
+py-cord[voice]>=2.6.0
+
+# Speech-to-text — openai-whisper (requires torch; auto-downloads model on first run)
+# GPU: needs torch with CUDA — install from https://pytorch.org/get-started/locally/
+openai-whisper
+
+# Audio mixing + MP3 export  (requires ffmpeg in PATH — see README)
+pydub
+
+# Local LLM for summarization (must have Ollama running: https://ollama.com)
+ollama
+
+# Environment variable loader
+python-dotenv
